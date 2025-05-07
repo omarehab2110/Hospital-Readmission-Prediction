@@ -1,110 +1,92 @@
+# Data Preprocessing Script for Hospital Readmission Prediction
+
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
-import os
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 
-# --- CONFIG ---
-DATA_PATH = os.path.join('data', 'diabetic_data.csv')
-MAPPING_PATH = os.path.join('data', 'IDs_mapping.csv')
-CHUNK_SIZE = 10000
-PARQUET_PATH = os.path.join('data', 'diabetic_data_cleaned.parquet')
-CSV_PATH = os.path.join('data', 'diabetic_data_cleaned.csv')
+# Load the mapping file for decoding IDs manually by sections
+print('Loading mapping file manually...')
 
-# --- 1. Load Mapping Dictionaries ---
-def load_mapping(section):
-    mapping = {}
-    lines = []
-    with open(MAPPING_PATH) as f:
-        found = False
-        for line in f:
-            if line.strip() == section:
-                found = True
-                continue
-            if found:
-                if line.strip() == '':
-                    break
-                lines.append(line.strip().split(','))
-    for row in lines:
-        if len(row) == 2 and row[0] and row[1]:
-            mapping[row[0]] = row[1]
-    return mapping
+# Read specific sections of the CSV file
+admission_type_mapping = pd.read_csv('data/IDs_mapping.csv', nrows=9, names=['id', 'description'])
 
-admission_type_map = load_mapping('admission_type_id,description')
-discharge_disposition_map = load_mapping('discharge_disposition_id,description')
-admission_source_map = load_mapping('admission_source_id,description')
+# Skip to discharge_disposition_id section (lines 11-40 in the file)
+discharge_disposition_mapping = pd.read_csv('data/IDs_mapping.csv', skiprows=10, nrows=30, names=['id', 'description'])
 
-# --- 2. Process Data in Chunks ---
-def map_column(df, col, mapping):
-    df[col + '_desc'] = df[col].astype(str).map(mapping).fillna('Unknown')
+# Skip to admission_source_id section (lines 42-67 in the file)
+admission_source_mapping = pd.read_csv('data/IDs_mapping.csv', skiprows=41, nrows=26, names=['id', 'description'])
+
+# Function to decode IDs using the mapping file
+def decode_ids(df, column, mapping_df):
+    mapping_dict = dict(zip(mapping_df['id'], mapping_df['description']))
+    df[column] = df[column].map(mapping_dict)
     return df
 
-chunks = []
-for chunk in pd.read_csv(DATA_PATH, na_values='?', low_memory=False, chunksize=CHUNK_SIZE):
-    # Handle missing values
-    cat_cols = chunk.select_dtypes(include=['object']).columns.tolist()
-    num_cols = chunk.select_dtypes(include=[np.number]).columns.tolist()
-    for col in cat_cols:
-        chunk[col] = chunk[col].fillna('Unknown')
-    for col in num_cols:
-        chunk[col] = chunk[col].fillna(chunk[col].median())
-    # Map ID columns
-    chunk = map_column(chunk, 'admission_type_id', admission_type_map)
-    chunk = map_column(chunk, 'discharge_disposition_id', discharge_disposition_map)
-    chunk = map_column(chunk, 'admission_source_id', admission_source_map)
-    chunks.append(chunk)
+# Load a small subset of the data for initial exploration 
+print('Loading a subset of the data for preprocessing setup...')
+data_subset = pd.read_csv('data/diabetic_data.csv')
 
-# --- 3. Concatenate All Chunks ---
-df = pd.concat(chunks, ignore_index=True)
+# Display initial data info
+print('Initial Data Info:')
+print(data_subset.info())
 
-# --- 4. Drop Useless Columns ---
-# Drop original ID columns and columns with only one unique value
-drop_cols = ['admission_type_id', 'discharge_disposition_id', 'admission_source_id']
-drop_cols += [col for col in df.columns if df[col].nunique() <= 1]
-df = df.drop(columns=drop_cols)
+# Handle missing values (example strategy: fill with mode for categorical, mean for numerical)
+print('Handling missing values...')
+for column in data_subset.columns:
+    if data_subset[column].dtype == 'object':
+        data_subset[column].fillna(data_subset[column].mode()[0], inplace=True)
+    else:
+        data_subset[column].fillna(data_subset[column].mean(), inplace=True)
 
-# --- 5. Encode Categorical Features Efficiently ---
-categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
-categorical_cols = [col for col in categorical_cols if col != 'readmitted']
-low_card_cols = [col for col in categorical_cols if df[col].nunique() <= 10]
-high_card_cols = [col for col in categorical_cols if df[col].nunique() > 10]
+# Decode ID columns using mapping file
+print('Decoding ID columns...')
+data_subset = decode_ids(data_subset, 'admission_type_id', admission_type_mapping)
+data_subset = decode_ids(data_subset, 'discharge_disposition_id', discharge_disposition_mapping)
+data_subset = decode_ids(data_subset, 'admission_source_id', admission_source_mapping)
 
-# One-hot encode low-cardinality categoricals
-if low_card_cols:
-    encoder = OneHotEncoder(sparse_output=True, handle_unknown='ignore')
-    encoded = encoder.fit_transform(df[low_card_cols])
-    encoded_df = pd.DataFrame.sparse.from_spmatrix(encoded, columns=encoder.get_feature_names_out(low_card_cols))
-    df = pd.concat([df.drop(low_card_cols, axis=1).reset_index(drop=True), encoded_df.reset_index(drop=True)], axis=1)
+# Encode categorical features
+print('Encoding categorical features...')
+le = LabelEncoder()
+categorical_cols = data_subset.select_dtypes(include=['object']).columns
+for col in categorical_cols:
+    data_subset[col] = le.fit_transform(data_subset[col])
 
-# Label encode high-cardinality categoricals
-for col in high_card_cols:
-    df[col] = df[col].astype('category').cat.codes
-
-# --- 6. Scale Numerical Features ---
-num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+# Normalize numerical columns
+print('Normalizing numerical columns...')
 scaler = MinMaxScaler()
-df[num_cols] = scaler.fit_transform(df[num_cols])
+numerical_cols = data_subset.select_dtypes(include=['int64', 'float64']).columns
+if len(numerical_cols) > 0:
+    data_subset[numerical_cols] = scaler.fit_transform(data_subset[numerical_cols])
 
-# --- 7. Outlier Handling ---
-for col in num_cols:
-    df[col] = np.clip(df[col], -4, 4)
+# Feature selection by correlation
+print('Selecting features by correlation with the target (readmitted)...')
+correlation_threshold = 0.05
 
-# --- 8. Feature Selection: Remove Highly Correlated Features ---
-corr_matrix = df[num_cols].corr().abs()
-upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-to_drop = [column for column in upper.columns if any(upper[column] > 0.9)]
-df = df.drop(to_drop, axis=1)
+# Ensure 'readmitted' is not dropped and is encoded as numeric for correlation
+if 'readmitted' in data_subset.columns and data_subset['readmitted'].dtype == 'object':
+    data_subset['readmitted'] = le.fit_transform(data_subset['readmitted'])
 
-# --- 9. Downcast Numeric Types ---
-for col in df.select_dtypes(include=['float64']).columns:
-    df[col] = pd.to_numeric(df[col], downcast='float')
-for col in df.select_dtypes(include=['int64']).columns:
-    df[col] = pd.to_numeric(df[col], downcast='integer')
+# Fix the 'readmitted' column to be binary: 1 for <30, 0 for others
+readmit_map = {'<30': 1, '>30': 0, 'NO': 0, 1.0: 1, 0.5: 0, 0.0: 0}
+data_subset['readmitted'] = data_subset['readmitted'].map(readmit_map).astype(int)
 
-# --- 10. Save Cleaned Data ---
-try:
-    df.to_parquet(PARQUET_PATH, index=False)
-except Exception as e:
-    print(f"Could not save as Parquet: {e}")
-df.to_csv(CSV_PATH, index=False)
+correlations = data_subset.corr()['readmitted'].abs()
+selected_features = correlations[correlations > correlation_threshold].index.tolist()
 
-print(f"Preprocessing complete. Saved to {PARQUET_PATH} and {CSV_PATH}.")
+print(f'Selected features: {selected_features}')
+data_subset = data_subset[selected_features]
+
+# Save the preprocessed subset for reference
+print('Saving preprocessed subset...')
+data_subset.to_csv('preprocessed_subset.csv', index=False)
+
+print('Preprocessing script setup complete. This script processes only a subset of data.')
+print('To process the full dataset, modify the script to handle larger data in chunks or use the full file.')
+
+# Show a sample after mapping
+data_subset.head().to_csv('data/diabetic_data_sample_mapped.csv', index=False)
+print('\nSample with mapped columns saved to data/diabetic_data_sample_mapped.csv')
+
+# Save the entire mapped dataset with corrected 'readmitted'
+data_subset.to_csv('data/diabetic_data_mapped.csv', index=False)
+print('Full mapped dataset saved to data/diabetic_data_mapped.csv') 
